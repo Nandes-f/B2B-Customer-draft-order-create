@@ -46,41 +46,58 @@ app.use(express.json());
 
 // Session-token auth for customer account extension (no merchant cookie).
 // Verifies JWT from Authorization: Bearer <token>, loads shop session, sets res.locals.shopify.session.
+function send401(res, code, message) {
+  return res.status(401).json({ error: message, code });
+}
+
 async function sessionTokenAuth(req, res, next) {
   const auth = req.get("Authorization");
   if (!auth || !auth.startsWith("Bearer ")) {
-    return res.status(401).json({ error: "Missing or invalid Authorization header" });
+    return send401(res, "missing_auth", "Missing or invalid Authorization header");
   }
-  const token = auth.slice(7);
+  const token = auth.slice(7).trim();
   const secret = process.env.SHOPIFY_API_SECRET;
   if (!secret) {
-    return res.status(500).json({ error: "Server misconfiguration" });
+    return res.status(500).json({ error: "Server misconfiguration: SHOPIFY_API_SECRET not set", code: "no_secret" });
   }
+  let payload;
   try {
-    const { payload } = await jwtVerify(
+    const result = await jwtVerify(
       token,
       new TextEncoder().encode(secret),
       { algorithms: ["HS256"] }
     );
-    const dest = payload.dest;
-    if (!dest) {
-      return res.status(401).json({ error: "Invalid token: missing dest" });
-    }
-    const shop = typeof dest === "string" ? dest.replace(/^https?:\/\//, "").split("/")[0] : "";
-    if (!shop) {
-      return res.status(401).json({ error: "Invalid token: invalid dest" });
-    }
-    const sessionId = `offline_${shop}`;
-    const session = await sessionStorage.loadSession(sessionId);
-    if (!session) {
-      return res.status(401).json({ error: "No app session for this shop. Merchant must install the app." });
-    }
-    res.locals.shopify = { session };
-    next();
+    payload = result.payload;
   } catch (err) {
     console.error("Session token verification failed:", err.message);
-    return res.status(401).json({ error: "Invalid or expired session token" });
+    return send401(res, "invalid_token", "Invalid or expired session token: " + err.message);
   }
+  // Customer account token payload: dest = "store-name.myshopify.com" (no protocol)
+  const dest = payload.dest || payload.des;
+  if (!dest) {
+    return send401(res, "missing_dest", "Invalid token: missing dest (payload: " + Object.keys(payload).join(",") + ")");
+  }
+  const shop = typeof dest === "string" ? dest.replace(/^https?:\/\//, "").split("/")[0].toLowerCase() : "";
+  if (!shop) {
+    return send401(res, "invalid_dest", "Invalid token: invalid dest");
+  }
+  // Try session id formats the Shopify app may use
+  const sessionIds = [`offline_${shop}`, `offline_https://${shop}`, shop];
+  let session = null;
+  for (const sid of sessionIds) {
+    session = await sessionStorage.loadSession(sid);
+    if (session) break;
+  }
+  if (!session) {
+    console.error("No stored session for shop:", shop, "tried ids:", sessionIds);
+    return send401(
+      res,
+      "session_not_found",
+      "No app session for this shop. Have the merchant open the app in Shopify Admin once (to install the session). On Render, ensure the app has a persistent disk so the session database is not lost on deploy."
+    );
+  }
+  res.locals.shopify = { session };
+  next();
 }
 
 // Extension-only route: complete draft order (called from customer account with Bearer token).
