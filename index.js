@@ -1,12 +1,20 @@
 import "./load-env.js";
+import { URLSearchParams } from "node:url";
 import express from "express";
 import { jwtVerify } from "jose";
 
-const {
-  SHOPIFY_API_KEY,
-  SHOPIFY_API_SECRET,
-  SCOPES = "read_draft_orders,write_draft_orders,read_customers",
-} = process.env;
+const SHOP = process.env.SHOPIFY_SHOP || process.env.SHOP;
+const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || process.env.SHOPIFY_API_KEY;
+const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || process.env.SHOPIFY_API_SECRET;
+
+function normalizeShop(shop) {
+  if (!shop || typeof shop !== "string") return "";
+  const s = shop.trim().toLowerCase();
+  if (s.includes(".myshopify.com")) return s.split("/")[0];
+  return s + ".myshopify.com";
+}
+
+const SHOP_DOMAIN = normalizeShop(SHOP);
 
 const app = express();
 
@@ -25,33 +33,36 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-// ── Token exchange: session token → access token ─────────────────────────────
-// Uses Shopify's token exchange grant: no DB, no OAuth callback, no stored tokens.
-// https://shopify.dev/docs/apps/build/authentication-authorization/access-tokens/token-exchange
-async function exchangeToken(sessionToken, shop) {
-  const url = `https://${shop}/admin/oauth/access_token`;
-  const body = {
-    client_id: SHOPIFY_API_KEY,
-    client_secret: SHOPIFY_API_SECRET,
-    grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
-    subject_token: sessionToken,
-    subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
-    requested_token_type: "urn:shopify:params:oauth:token-type:offline-access-token",
-  };
-  const resp = await fetch(url, {
+// ── Client credentials: get access token (cached) ───────────────────────────────
+let cachedToken = null;
+let tokenExpiresAt = 0;
+
+async function getToken() {
+  if (cachedToken && Date.now() < tokenExpiresAt - 60_000) return cachedToken;
+
+  const url = `https://${SHOP_DOMAIN}/admin/oauth/access_token`;
+  const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+    }),
   });
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`Token exchange failed (${resp.status}): ${text}`);
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Token request failed (${response.status}): ${text}`);
   }
-  const data = await resp.json();
-  return data.access_token;
+
+  const { access_token, expires_in } = await response.json();
+  cachedToken = access_token;
+  tokenExpiresAt = Date.now() + expires_in * 1000;
+  return cachedToken;
 }
 
-// ── Auth middleware for extension requests ────────────────────────────────────
+// ── Auth middleware: verify extension JWT, then use client-credentials token ──
 async function sessionTokenAuth(req, res, next) {
   const auth = req.get("Authorization");
   if (!auth || !auth.startsWith("Bearer ")) {
@@ -59,44 +70,41 @@ async function sessionTokenAuth(req, res, next) {
   }
   const token = auth.slice(7).trim();
 
-  // 1. Verify the JWT signature
+  // 1. Verify JWT so we know the request is from Shopify and for our store
   let payload;
   try {
     const result = await jwtVerify(
       token,
-      new TextEncoder().encode(SHOPIFY_API_SECRET),
+      new TextEncoder().encode(CLIENT_SECRET),
       { algorithms: ["HS256"] }
     );
     payload = result.payload;
   } catch (err) {
     console.error("JWT verification failed:", err.message);
-    return res.status(401).json({ error: "Invalid session token: " + err.message, code: "invalid_token" });
+    return res.status(401).json({ error: "Invalid session token", code: "invalid_token" });
   }
 
-  // 2. Extract shop from dest claim
+  // 2. Ensure token is for our configured shop
   const dest = payload.dest || payload.des || "";
-  const shop = String(dest).replace(/^https?:\/\//, "").split("/")[0].toLowerCase();
-  if (!shop) {
-    return res.status(401).json({ error: "No shop in token", code: "no_shop" });
+  const tokenShop = String(dest).replace(/^https?:\/\//, "").split("/")[0].toLowerCase();
+  if (!tokenShop || normalizeShop(tokenShop) !== SHOP_DOMAIN) {
+    return res.status(401).json({ error: "Token shop does not match app shop", code: "shop_mismatch" });
   }
 
-  // 3. Exchange session token for an access token (Shopify handles this)
-  let accessToken;
+  // 3. Get access token via client_credentials and attach to request
   try {
-    accessToken = await exchangeToken(token, shop);
+    const accessToken = await getToken();
+    req.shopSession = { shop: SHOP_DOMAIN, accessToken };
+    next();
   } catch (err) {
-    console.error("Token exchange failed:", err.message);
-    return res.status(401).json({ error: err.message, code: "exchange_failed" });
+    console.error("getToken failed:", err.message);
+    return res.status(503).json({ error: "Could not get access token", code: "token_failed" });
   }
-
-  // 4. Attach to request for downstream handlers
-  req.shopSession = { shop, accessToken };
-  next();
 }
 
 // ── GraphQL helper ───────────────────────────────────────────────────────────
 async function adminGraphql(shop, accessToken, query, variables = {}) {
-  const url = `https://${shop}/admin/api/2026-01/graphql.json`;
+  const url = `https://${shop}/admin/api/2025-01/graphql.json`;
   const resp = await fetch(url, {
     method: "POST",
     headers: {
@@ -109,7 +117,11 @@ async function adminGraphql(shop, accessToken, query, variables = {}) {
     const text = await resp.text();
     throw new Error(`Admin API error (${resp.status}): ${text}`);
   }
-  return resp.json();
+  const json = await resp.json();
+  if (json.errors?.length) {
+    throw new Error(`GraphQL errors: ${JSON.stringify(json.errors)}`);
+  }
+  return json;
 }
 
 // ── GraphQL operations ───────────────────────────────────────────────────────
@@ -176,7 +188,6 @@ app.delete("/api/draft-orders/:id", sessionTokenAuth, async (req, res) => {
   }
 });
 
-// Health check
 app.get("/", (_req, res) => res.json({ status: "ok" }));
 
 const PORT = parseInt(process.env.PORT || "3000");
