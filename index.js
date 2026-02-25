@@ -1,3 +1,4 @@
+import "./load-env.js";
 import { shopifyApp } from "@shopify/shopify-app-express";
 import { SQLiteSessionStorage } from "@shopify/shopify-app-session-storage-sqlite";
 import express from "express";
