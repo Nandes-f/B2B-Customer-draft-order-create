@@ -1,0 +1,5 @@
+# Web process run by `shopify app dev`
+# https://shopify.dev/docs/apps/build/cli-for-apps/app-structure#shopify-web-toml
+
+[commands]
+dev = "node index.js"
