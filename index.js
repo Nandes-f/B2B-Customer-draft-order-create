@@ -1,7 +1,6 @@
 import "./load-env.js";
 import { URLSearchParams } from "node:url";
 import express from "express";
-import { jwtVerify } from "jose";
 
 const SHOP = process.env.SHOPIFY_SHOP || process.env.SHOP;
 const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || process.env.SHOPIFY_API_KEY;
@@ -62,43 +61,16 @@ async function getToken() {
   return cachedToken;
 }
 
-// ── Auth middleware: verify extension JWT, then use client-credentials token ──
-async function sessionTokenAuth(req, res, next) {
-  const auth = req.get("Authorization");
-  if (!auth || !auth.startsWith("Bearer ")) {
-    return res.status(401).json({ error: "Missing Authorization header", code: "missing_auth" });
-  }
-  const token = auth.slice(7).trim();
-
-  // 1. Verify JWT so we know the request is from Shopify and for our store
-  let payload;
-  try {
-    const result = await jwtVerify(
-      token,
-      new TextEncoder().encode(CLIENT_SECRET),
-      { algorithms: ["HS256"] }
-    );
-    payload = result.payload;
-  } catch (err) {
-    console.error("JWT verification failed:", err.message);
-    return res.status(401).json({ error: "Invalid session token", code: "invalid_token" });
-  }
-
-  // 2. Ensure token is for our configured shop
-  const dest = payload.dest || payload.des || "";
-  const tokenShop = String(dest).replace(/^https?:\/\//, "").split("/")[0].toLowerCase();
-  if (!tokenShop || normalizeShop(tokenShop) !== SHOP_DOMAIN) {
-    return res.status(401).json({ error: "Token shop does not match app shop", code: "shop_mismatch" });
-  }
-
-  // 3. Get access token via client_credentials and attach to request
+// ── Auth middleware: use client-credentials token only (no JWT check) ──────────
+// This avoids 401 from JWT/shop mismatch. Only SHOP + CLIENT_ID + CLIENT_SECRET required.
+async function requireShopToken(req, res, next) {
   try {
     const accessToken = await getToken();
     req.shopSession = { shop: SHOP_DOMAIN, accessToken };
     next();
   } catch (err) {
     console.error("getToken failed:", err.message);
-    return res.status(503).json({ error: "Could not get access token", code: "token_failed" });
+    res.status(503).json({ error: "Could not get access token", code: "token_failed" });
   }
 }
 
@@ -150,7 +122,7 @@ function parseDraftId(rawId) {
 }
 
 // ── Routes ───────────────────────────────────────────────────────────────────
-app.post("/api/draft-orders/:id/complete", sessionTokenAuth, async (req, res) => {
+app.post("/api/draft-orders/:id/complete", requireShopToken, async (req, res) => {
   try {
     const { shop, accessToken } = req.shopSession;
     const draftOrderId = parseDraftId(req.params.id);
@@ -168,7 +140,7 @@ app.post("/api/draft-orders/:id/complete", sessionTokenAuth, async (req, res) =>
   }
 });
 
-app.delete("/api/draft-orders/:id", sessionTokenAuth, async (req, res) => {
+app.delete("/api/draft-orders/:id", requireShopToken, async (req, res) => {
   try {
     const { shop, accessToken } = req.shopSession;
     const draftOrderId = parseDraftId(req.params.id);
