@@ -5,15 +5,23 @@ import express from "express";
 const SHOP = process.env.SHOPIFY_SHOP || process.env.SHOP;
 const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || process.env.SHOPIFY_API_KEY;
 const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || process.env.SHOPIFY_API_SECRET;
-
+const STATIC_ACCESS_TOKEN = (process.env.SHOPIFY_ACCESS_TOKEN || "").trim();
+console.log("STATIC_ACCESS_TOKEN", STATIC_ACCESS_TOKEN);
+console.log("CLIENT_ID", CLIENT_ID);
+console.log("CLIENT_SECRET", CLIENT_SECRET);
 function normalizeShop(shop) {
   if (!shop || typeof shop !== "string") return "";
-  const s = shop.trim().toLowerCase();
-  if (s.includes(".myshopify.com")) return s.split("/")[0];
+  const s = shop.trim().toLowerCase().replace(/\/$/, "");
+  if (s.includes(".myshopify.com")) return s;
   return s + ".myshopify.com";
 }
 
 const SHOP_DOMAIN = normalizeShop(SHOP);
+
+if (!SHOP_DOMAIN) {
+  console.error("SHOPIFY_SHOP is missing.");
+  process.exit(1);
+}
 
 const app = express();
 
@@ -32,12 +40,19 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-// ── Client credentials: get access token (cached) ───────────────────────────────
-let cachedToken = null;
-let tokenExpiresAt = 0;
+// ── Access token ─────────────────────────────────────────────────────────────
+// Strategy 1: SHOPIFY_ACCESS_TOKEN env var (custom app token — never expires)
+// Strategy 2: client_credentials (Dev Dashboard org app — expires in 24h, auto-refreshed)
+let ccToken = null;
+let ccExpiresAt = 0;
 
-async function getToken() {
-  if (cachedToken && Date.now() < tokenExpiresAt - 60_000) return cachedToken;
+async function getAccessToken() {
+  console.log("getAccessToken function");
+  // Prefer static token (from custom app in Shopify Admin)
+  if (STATIC_ACCESS_TOKEN) return STATIC_ACCESS_TOKEN;
+
+  // Fall back to client_credentials (only works for Dev Dashboard org apps)
+  if (ccToken && Date.now() < ccExpiresAt - 60_000) return ccToken;
 
   const url = `https://${SHOP_DOMAIN}/admin/oauth/access_token`;
   const response = await fetch(url, {
@@ -51,32 +66,42 @@ async function getToken() {
   });
 
   if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Token request failed (${response.status}): ${text}`);
+    const text = await response.text().catch(() => "");
+    const snippet = text.length > 300 ? text.slice(0, 300) : text;
+    throw new Error(
+      `client_credentials failed (${response.status}). ` +
+      `This grant only works for Dev Dashboard (organization) apps. ` +
+      `For Partner Dashboard apps, set SHOPIFY_ACCESS_TOKEN instead. ` +
+      `Response: ${snippet}`
+    );
   }
-
-  const { access_token, expires_in } = await response.json();
-  cachedToken = access_token;
-  tokenExpiresAt = Date.now() + expires_in * 1000;
-  return cachedToken;
+  const data = await response.json();
+  console.log("data", data);
+  console.log("client_credentials response:", {
+    access_token: data.access_token ? data.access_token.slice(0, 10) + "..." : null,
+    scope: data.scope,
+    expires_in: data.expires_in,
+  });
+  ccToken = data.access_token;
+  ccExpiresAt = Date.now() + (data.expires_in ?? 86400) * 1000;
+  return ccToken;
 }
 
-// ── Auth middleware: use client-credentials token only (no JWT check) ──────────
-// This avoids 401 from JWT/shop mismatch. Only SHOP + CLIENT_ID + CLIENT_SECRET required.
+// ── Auth middleware ───────────────────────────────────────────────────────────
 async function requireShopToken(req, res, next) {
   try {
-    const accessToken = await getToken();
+    const accessToken = await getAccessToken();
     req.shopSession = { shop: SHOP_DOMAIN, accessToken };
     next();
   } catch (err) {
-    console.error("getToken failed:", err.message);
-    res.status(503).json({ error: "Could not get access token", code: "token_failed" });
+    console.error("getAccessToken failed:", err.message);
+    res.status(503).json({ error: err.message, code: "token_failed" });
   }
 }
 
 // ── GraphQL helper ───────────────────────────────────────────────────────────
 async function adminGraphql(shop, accessToken, query, variables = {}) {
-  const url = `https://${shop}/admin/api/2025-01/graphql.json`;
+  const url = `https://${shop}/admin/api/2026-01/graphql.json`;
   const resp = await fetch(url, {
     method: "POST",
     headers: {
@@ -97,20 +122,23 @@ async function adminGraphql(shop, accessToken, query, variables = {}) {
 }
 
 // ── GraphQL operations ───────────────────────────────────────────────────────
+// Don't request draftOrder.order — it requires read_orders scope. Completing still creates the order.
 const DRAFT_ORDER_COMPLETE_MUTATION = `
-  mutation DraftOrderComplete($id: ID!) {
+  mutation draftOrderComplete($id: ID!) {
     draftOrderComplete(id: $id) {
-      draftOrder { id status order { id name } }
+      draftOrder {
+        id
+        status
+      }
       userErrors { field message }
     }
   }
 `;
 
 const DRAFT_ORDER_DELETE_MUTATION = `
-  mutation DraftOrderDelete($input: DraftOrderDeleteInput!) {
+  mutation draftOrderDelete($input: DraftOrderDeleteInput!) {
     draftOrderDelete(input: $input) {
-      deletedDraftOrderId
-      userErrors { field message }
+      deletedId
     }
   }
 `;
@@ -162,5 +190,28 @@ app.delete("/api/draft-orders/:id", requireShopToken, async (req, res) => {
 
 app.get("/", (_req, res) => res.json({ status: "ok" }));
 
+app.get("/api/test-token", async (_req, res) => {
+  try {
+    const accessToken = await getAccessToken();
+    const masked = accessToken.slice(0, 8) + "..." + accessToken.slice(-4);
+    res.json({ ok: true, token: masked, shop: SHOP_DOMAIN });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 const PORT = parseInt(process.env.PORT || "3000");
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Shop: ${SHOP_DOMAIN}`);
+  console.log(`Auth: ${STATIC_ACCESS_TOKEN ? "SHOPIFY_ACCESS_TOKEN (static)" : "client_credentials (auto-refresh)"}`);
+
+  // Test token on startup
+  console.log("\n--- Testing access token on startup ---");
+  try {
+    const token = await getAccessToken();
+    console.log(`Token OK: ${token}`);
+  } catch (err) {
+    console.error("Token FAILED:", err.message);
+  }
+});

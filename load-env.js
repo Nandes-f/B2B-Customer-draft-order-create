@@ -11,16 +11,21 @@ if (existsSync(envPath)) {
 }
 
 const SHOP = process.env.SHOPIFY_SHOP || process.env.SHOP;
-const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || process.env.SHOPIFY_API_KEY;
-const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || process.env.SHOPIFY_API_SECRET;
+const HAS_STATIC_TOKEN = !!(process.env.SHOPIFY_ACCESS_TOKEN || "").trim();
+const HAS_CLIENT_CREDS =
+  !!(process.env.SHOPIFY_CLIENT_ID || process.env.SHOPIFY_API_KEY) &&
+  !!(process.env.SHOPIFY_CLIENT_SECRET || process.env.SHOPIFY_API_SECRET);
 
-const missing = [];
-if (!SHOP) missing.push("SHOPIFY_SHOP or SHOP");
-if (!CLIENT_ID) missing.push("SHOPIFY_CLIENT_ID or SHOPIFY_API_KEY");
-if (!CLIENT_SECRET) missing.push("SHOPIFY_CLIENT_SECRET or SHOPIFY_API_SECRET");
+if (!SHOP) {
+  console.error("Missing required env var: SHOPIFY_SHOP (e.g. your-store.myshopify.com or your-store)");
+  process.exit(1);
+}
 
-if (missing.length) {
-  console.error("Missing required env vars:", missing.join(", "));
-  console.error("Set them in Render Dashboard → Environment, or in web/.env for local dev.");
+if (!HAS_STATIC_TOKEN && !HAS_CLIENT_CREDS) {
+  console.error(
+    "Auth config missing. Provide ONE of:\n" +
+    "  1. SHOPIFY_ACCESS_TOKEN  (from a custom app in Shopify Admin)\n" +
+    "  2. SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET  (Dev Dashboard org app only)"
+  );
   process.exit(1);
 }
